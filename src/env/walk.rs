@@ -1,6 +1,6 @@
 use super::{
     term::{Body, Const, Ctor, Defn, Expr, ExprId, Inductive, Kind, NameId, Rec},
-    Env,
+    Env, Opts,
 };
 use crate::error::{corrupt, Error, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -99,7 +99,12 @@ impl Env {
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<Self> {
-        let mut env = Self::build(search, roots, jobs, progress, true, true)?;
+        let opts = Opts {
+            live: true,
+            lazy: true,
+            ..Opts::default()
+        };
+        let mut env = Self::build(search, roots, jobs, progress, opts)?;
         let mut live = env.live.take().expect("built live");
         let mut todo = consts
             .iter()
@@ -148,7 +153,11 @@ impl Env {
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<Self> {
-        Self::build(search, roots, jobs, progress, false, true)
+        let opts = Opts {
+            lazy: true,
+            ..Opts::default()
+        };
+        Self::build(search, roots, jobs, progress, opts)
     }
 
     /// What the statements of `consts` rest on, with the index of each one's module, in

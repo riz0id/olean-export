@@ -19,6 +19,7 @@ pub(crate) enum Safety {
     Partial,
 }
 
+const MAX_CTOR: u8 = 244;
 const ARRAY: u8 = 246;
 const SCALAR_ARRAY: u8 = 248;
 const STRING: u8 = 249;
@@ -26,6 +27,18 @@ const MPZ: u8 = 250;
 const THUNK: u8 = 251;
 const TASK: u8 = 252;
 const REF: u8 = 253;
+
+/// The kind of a heap object, a constructor with its tag unless Lean gives it a layout of
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape {
+    Ctor(u8),
+    Array,
+    Bytes,
+    Str,
+    Nat,
+    Thunk,
+}
 
 /// Fields of the fixed-size header that precedes every compacted region.
 #[derive(Debug, Clone, Default)]
@@ -83,17 +96,37 @@ impl Image {
         Ok(img)
     }
 
-    pub(crate) fn push_part(&mut self, path: &Path) -> Result<()> {
-        self.map(path).map_err(at(path))
+    /// Open only a module's `.olean`, its public part, reading pages only as they are
+    /// touched rather than all up front. That part is self-contained, as Lean loads it alone
+    /// for a plain `import`, and a pointer out of it is an error like any other.
+    pub(crate) fn open_public(path: &Path) -> Result<Self> {
+        let mut img = Self {
+            parts: Vec::new(),
+            header: Header::default(),
+            root: 0,
+            public: 0,
+        };
+        img.map(path, false).map_err(at(path))?;
+        Ok(img)
     }
 
-    fn map(&mut self, path: &Path) -> Result<()> {
+    pub(crate) fn push_part(&mut self, path: &Path) -> Result<()> {
+        self.map(path, true).map_err(at(path))
+    }
+
+    /// Map the part at `path`, read in full up front if `eager`.
+    fn map(&mut self, path: &Path, eager: bool) -> Result<()> {
         let file = File::open(path)?;
         // SAFETY: the map is read-only and lives as long as `self`. Rewriting an .olean while
         // it is being read is undefined behaviour, the same assumption Lean makes when it maps them.
         #[allow(unsafe_code)]
-        let bytes = unsafe { MmapOptions::new().populate().map(&file)? };
-        bytes.advise(memmap2::Advice::WillNeed)?;
+        let bytes = if eager {
+            let bytes = unsafe { MmapOptions::new().populate().map(&file)? };
+            bytes.advise(memmap2::Advice::WillNeed)?;
+            bytes
+        } else {
+            unsafe { MmapOptions::new().map(&file)? }
+        };
         if bytes.len() < 96 || &bytes[..5] != b"olean" {
             return Err(Error::NotOlean);
         }
@@ -172,8 +205,7 @@ impl Image {
 
     /// The `k`th byte of a constructor's scalar area, which follows its object fields.
     pub(crate) fn scalar_u8(&self, o: u64, k: u64) -> Result<u8> {
-        let num_objs = u64::from(self.u8(o + 6)?);
-        self.u8(o + 8 + 8 * num_objs + k)
+        self.u8(o + 8 + 8 * self.num_objs(o)? + k)
     }
 
     /// How the `ConstantInfo` at `info` was declared, from the flags its kind keeps in the
@@ -194,7 +226,7 @@ impl Image {
     }
 
     pub(crate) fn scalar_u32(&self, o: u64) -> Result<u32> {
-        let b = self.bytes(o + 8 + 8 * u64::from(self.u8(o + 6)?), 4)?;
+        let b = self.bytes(o + 8 + 8 * self.num_objs(o)?, 4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
@@ -209,8 +241,6 @@ impl Image {
             }
             Ok(())
         };
-        let b = self.bytes(o + 4, 2)?;
-        let cs_sz = u64::from(u16::from_le_bytes([b[0], b[1]]));
         let size = match self.tag(o)? {
             ARRAY => {
                 each(o + 24, self.u64(o + 8)?)?;
@@ -226,14 +256,62 @@ impl Image {
                 each(o + 8, 1)?;
                 16
             }
-            MPZ => cs_sz,
-            t if t > MPZ => return Err(corrupt(format!("unexpected object tag {t} at {o:#x}"))),
+            MPZ => self.cs_sz(o)?,
+            t if t > MAX_CTOR => {
+                return Err(corrupt(format!("unexpected object tag {t} at {o:#x}")))
+            }
             _ => {
-                each(o + 8, u64::from(self.u8(o + 6)?))?;
-                cs_sz
+                each(o + 8, self.num_objs(o)?)?;
+                self.cs_sz(o)?
             }
         };
         Ok(size.next_multiple_of(8))
+    }
+
+    /// What kind of object is at `o`, for reading a value whose type is not known.
+    pub(crate) fn shape(&self, o: u64) -> Result<Shape> {
+        Ok(match self.tag(o)? {
+            ARRAY => Shape::Array,
+            SCALAR_ARRAY => Shape::Bytes,
+            STRING => Shape::Str,
+            MPZ => Shape::Nat,
+            THUNK => Shape::Thunk,
+            t if t > MAX_CTOR => {
+                return Err(corrupt(format!("unexpected object tag {t} at {o:#x}")))
+            }
+            t => Shape::Ctor(t),
+        })
+    }
+
+    /// The size in bytes Lean records for the small object at `o`.
+    fn cs_sz(&self, o: u64) -> Result<u64> {
+        let b = self.bytes(o + 4, 2)?;
+        Ok(u64::from(u16::from_le_bytes([b[0], b[1]])))
+    }
+
+    /// How many object fields the constructor at `o` has.
+    pub(crate) fn num_objs(&self, o: u64) -> Result<u64> {
+        self.u8(o + 6).map(u64::from)
+    }
+
+    /// The scalar area of the constructor at `o`, padded to whole words as Lean allocated it.
+    pub(crate) fn scalars(&self, o: u64) -> Result<&[u8]> {
+        let start = 8 + 8 * self.num_objs(o)?;
+        let len = self
+            .cs_sz(o)?
+            .checked_sub(start)
+            .ok_or_else(|| corrupt(format!("constructor at {o:#x} is smaller than its fields")))?;
+        self.bytes(o + start, usize::try_from(len).map_err(corrupt)?)
+    }
+
+    /// The elements of the scalar array at `o`, as bytes.
+    pub(crate) fn scalar_array(&self, o: u64) -> Result<&[u8]> {
+        self.expect(o, SCALAR_ARRAY, "a scalar array")?;
+        let len = u64::from(self.u8(o + 6)?)
+            .checked_mul(self.u64(o + 8)?)
+            .and_then(|l| usize::try_from(l).ok())
+            .ok_or_else(|| corrupt(format!("scalar array at {o:#x} is too large")))?;
+        self.bytes(o + 24, len)
     }
 
     fn expect(&self, o: u64, tag: u8, what: &str) -> Result<()> {

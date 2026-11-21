@@ -1,0 +1,42 @@
+---
+source: tests/attrs.rs
+expression: out
+---
+Base reducibilityCore global Eq.recOn
+  (0 `Eq.recOn 0)
+Base reducibilityCore global Pair.fst
+  (0 `Pair.fst 0)
+Base reducibilityCore global N.casesOn
+  (0 `N.casesOn 0)
+Base reducibilityCore global PUnit.casesOn
+  (0 `PUnit.casesOn 0)
+Base reducibilityCore global Pair.snd
+  (0 `Pair.snd 0)
+Base reducibilityCore global Pair.recOn
+  (0 `Pair.recOn 0)
+Base reducibilityCore global N.recOn
+  (0 `N.recOn 0)
+Base reducibilityCore global PUnit.recOn
+  (0 `PUnit.recOn 0)
+Base reducibilityCore global Pair.casesOn
+  (0 `Pair.casesOn 0)
+Attrs Lean.classExtension global Zero
+  (0 `Zero #[] #[])
+Attrs reducibilityCore global Pairs.instZeroPair
+  (0 `Pairs.instZeroPair 4)
+Attrs reducibilityCore global same
+  (0 `same 0)
+Attrs reducibilityCore global Zero.recOn
+  (0 `Zero.recOn 0)
+Attrs reducibilityCore global instZeroN
+  (0 `instZeroN 4)
+Attrs reducibilityCore global Zero.casesOn
+  (0 `Zero.casesOn 0)
+Attrs Lean.Compiler.inlineAttrs global double
+  (0 `double 0)
+Attrs Lean.matchPatternAttr global one
+  `one
+Attrs Lean.Meta.instanceExtension global ?
+  (0 (0 #[(4 `Zero 1) (4 `N 0)] (4 `instZeroN 0 | [200, 188, 199, 75, 0, 0, 0, 0]) 1000 (1 `instZeroN) #[] | [0, 0, 0, 0, 0, 0, 0, 0]))
+Attrs Lean.Meta.instanceExtension scoped Pairs ?
+  (1 `Pairs (0 #[(4 `Zero 1) (4 `Pair 2) (4 `N 0) (4 `N 0)] (4 `Pairs.instZeroPair 0 | [75, 251, 0, 167, 0, 0, 0, 0]) 50 (1 `Pairs.instZeroPair) #[] | [2, 0, 0, 0, 0, 0, 0, 0]))

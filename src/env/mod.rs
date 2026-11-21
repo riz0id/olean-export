@@ -1,9 +1,11 @@
+mod attr;
 mod decode;
 mod reload;
 mod table;
 mod term;
 mod walk;
 
+pub use attr::{Attr, Attrs, Entries, Scope, Value, ValueId};
 pub use reload::Reload;
 pub use table::{Exprs, Table};
 pub use term::{
@@ -13,7 +15,7 @@ pub use term::{
 pub(crate) use walk::{Builtins, Dep, Depth, Family};
 
 use self::{
-    decode::{decode_all, Module},
+    decode::{decode_all, decode_attr_ranges, Module},
     reload::{stamp, Live, Loaded, Stamp},
     table::{Shared, SharedExprs, Tables},
 };
@@ -22,16 +24,39 @@ use crate::{
     inspect::Import,
     olean::{Header, Image},
 };
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     borrow::Cow,
-    env,
+    env, mem,
+    ops::Range,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering::Relaxed},
     thread,
 };
 
 static LINEAGE: AtomicU64 = AtomicU64::new(0);
+
+/// What [`Env::attrs_of_many`] decodes of one module: the module, and for each `(k, range)`
+/// that range of the entries at `env.entries[module][k]` (see [`Env::entries`]).
+pub type AttrRequest = (usize, Vec<(usize, Range<usize>)>);
+
+/// An [`AttrRequest`] checked against the index: the olean, the module's rank and the
+/// entries asked for.
+type Located = (PathBuf, u32, Vec<(Entries, Range<usize>)>);
+
+/// How `Env::build` loads.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Opts<'a> {
+    /// Keep what [`Env::reload`] needs.
+    pub(super) live: bool,
+    /// Leave theorem values in their oleans.
+    pub(super) lazy: bool,
+    /// The environment extensions to read the entries of.
+    pub(super) attrs: &'a [&'a str],
+    /// Only find where their entries are, for [`Env::attrs_of`].
+    pub(super) index: bool,
+}
 
 /// Every constant reachable from a set of root modules, in import order.
 #[derive(Debug)]
@@ -48,6 +73,14 @@ pub struct Env {
     pub imports: Vec<Vec<Import>>,
     /// What each module in the module system exports, true where only the statement.
     pub exported: Vec<Option<FxHashMap<NameId, bool>>>,
+    /// The extension entries of each module in `modules`, for an environment from
+    /// [`Env::load_attrs`]. Any other has none, and so no element here.
+    pub attrs: Vec<Attrs>,
+    /// Where the extension entries of each module in `modules` are, for an environment from
+    /// [`Env::load_attrs_lazy`], to decode with [`Env::attrs_of`]. Any other has none.
+    pub entries: Vec<Vec<Entries>>,
+    /// The olean and its stamp at load of each module, kept for [`Env::attrs_of`].
+    sources: Vec<(PathBuf, Stamp)>,
     pub header: Header,
     pub skipped: usize,
     /// Where each module's constants end in `order`.
@@ -165,7 +198,122 @@ impl Env {
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<Self> {
-        Self::build(search, roots, jobs, progress, false, false)
+        Self::build(search, roots, jobs, progress, Opts::default())
+    }
+
+    /// Like [`Env::load_with`], also reading the entries each module exports for the
+    /// environment extensions in `attrs`, into [`Env::attrs`]. Lean keeps an attribute's
+    /// uses in such an extension, named in full as `inspect` lists it, for example
+    /// `Lean.Meta.instanceExtension`. A name no module has entries for gives none. A module
+    /// in the module system exports the entries of its public part, those a plain `import`
+    /// of it sees.
+    ///
+    /// An olean does not say what type an extension's entries have, so each is read by its
+    /// layout into a [`Value`], and its scope and declaration found where it has the layout
+    /// the attributes Lean provides builders for use.
+    pub fn load_attrs(
+        search: &[PathBuf],
+        roots: &[&str],
+        attrs: &[&str],
+        jobs: usize,
+        progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Self> {
+        let opts = Opts {
+            attrs,
+            ..Opts::default()
+        };
+        Self::build(search, roots, jobs, progress, opts)
+    }
+
+    /// Like [`Env::load_attrs`], but only finding where each module keeps the entries, into
+    /// [`Env::entries`], to decode as needed with [`Env::attrs_of`]. That costs about as
+    /// much as a load without them.
+    pub fn load_attrs_lazy(
+        search: &[PathBuf],
+        roots: &[&str],
+        attrs: &[&str],
+        jobs: usize,
+        progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Self> {
+        let opts = Opts {
+            attrs,
+            index: true,
+            ..Opts::default()
+        };
+        Self::build(search, roots, jobs, progress, opts)
+    }
+
+    /// Decode entries of `module` from its olean: for each `(k, range)` in `want`, that range
+    /// of the entries at `self.entries[module][k]` (see [`Env::entries`]). Values shared
+    /// between them are decoded once. Each call reads the olean afresh, so asking for a
+    /// module's entries in one call costs less than in many.
+    ///
+    /// Fails if the olean changed since the load, or a range is past its entries.
+    pub fn attrs_of(&mut self, module: usize, want: &[(usize, Range<usize>)]) -> Result<Attrs> {
+        let mut attrs = self.attrs_of_many(&[(module, want.to_vec())], 1)?;
+        Ok(attrs.pop().expect("one module asked for"))
+    }
+
+    /// Like [`Env::attrs_of`] for many modules at once, decoding them on `jobs` threads.
+    /// `want` has each module with its `(k, range)` requests, and the result is in its
+    /// order. Fails, decoding nothing, if any module or extension asked for is not there or
+    /// any olean changed since the load.
+    pub fn attrs_of_many(&mut self, want: &[AttrRequest], jobs: usize) -> Result<Vec<Attrs>> {
+        let requests = want
+            .iter()
+            .map(|(m, ks)| self.request(*m, ks))
+            .collect::<Result<Vec<_>>>()?;
+        let tables = self.names_only();
+        let decoded = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs.max(1))
+            .build()
+            .map_err(Error::from)
+            .and_then(|pool| {
+                pool.install(|| {
+                    requests
+                        .par_iter()
+                        .map(|(path, rank, w)| decode_attr_ranges(&tables, path, *rank, w))
+                        .collect::<Result<Vec<_>>>()
+                })
+            });
+        self.names = tables.names.freeze();
+        decoded
+    }
+
+    /// The olean, rank and located ranges of one request of [`Env::attrs_of_many`].
+    fn request(&self, module: usize, want: &[(usize, Range<usize>)]) -> Result<Located> {
+        let (Some((path, at_load)), Some(entries)) =
+            (self.sources.get(module), self.entries.get(module))
+        else {
+            return Err(Error::Misuse(
+                "attrs_of needs a module of an Env::load_attrs_lazy",
+            ));
+        };
+        let want = want
+            .iter()
+            .map(|(k, r)| entries.get(*k).map(|&e| (e, r.clone())))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::Misuse(
+                "attrs_of asked for an extension the module has no entries of",
+            ))?;
+        if stamp(path) != *at_load {
+            return Err(at(path)(Error::Misuse(
+                "olean changed since the environment was loaded",
+            )));
+        }
+        let rank = u32::try_from(module).expect("module count");
+        Ok((path.clone(), rank, want))
+    }
+
+    /// The names table in shared form, with empty tables for the rest, for decoding
+    /// extension entries, which only add names. Freeze `names` back after.
+    fn names_only(&mut self) -> Tables {
+        Tables {
+            names: mem::replace(&mut self.names, Table(Vec::new())).thaw(),
+            levels: Shared::new(Level::Zero, 0),
+            univs: Shared::new(Univs(Box::new([])), 0),
+            exprs: SharedExprs::new(0),
+        }
     }
 
     fn build(
@@ -173,8 +321,7 @@ impl Env {
         roots: &[&str],
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
-        live: bool,
-        lazy: bool,
+        opts: Opts<'_>,
     ) -> Result<Self> {
         let found = discover_all(search, roots)?;
         let stamps: Vec<Stamp> = found.iter().map(|(_, p)| stamp(p)).collect();
@@ -189,10 +336,31 @@ impl Env {
             exprs: SharedExprs::new(estimate(64)),
         };
         let paths: Vec<_> = found.iter().map(|(_, p)| p.as_path()).enumerate().collect();
-        let decoded = decode_all(&tables, &paths, jobs, progress, lazy);
+        let decoded = decode_all(
+            &tables, &paths, jobs, progress, opts.lazy, opts.attrs, opts.index,
+        );
         let (exprs, index, ranks) = tables.exprs.freeze();
-        let kept = live.then_some((index, ranks));
-        let decoded = decoded?;
+        let kept = opts.live.then_some((index, ranks));
+        let mut decoded = decoded?;
+        let (entries, sources) = if opts.index {
+            let entries = decoded
+                .iter_mut()
+                .map(|m| mem::take(&mut m.index))
+                .collect();
+            let sources = found
+                .iter()
+                .map(|(_, p)| p.clone())
+                .zip(stamps.clone())
+                .collect();
+            (entries, sources)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let attrs = if opts.attrs.is_empty() || opts.index {
+            Vec::new()
+        } else {
+            (decoded.iter_mut().map(|m| mem::take(&mut m.attrs))).collect()
+        };
         let mut env = Self {
             names: tables.names.freeze(),
             levels: tables.levels.freeze(),
@@ -204,6 +372,9 @@ impl Env {
             modules: Vec::new(),
             imports: Vec::new(),
             exported: Vec::new(),
+            attrs,
+            entries,
+            sources,
             header: Header::default(),
             skipped: 0,
             ends: Vec::new(),

@@ -3,7 +3,7 @@ use super::{
     discover_all,
     table::{SharedExprs, Table, Tables},
     term::NameId,
-    Env,
+    Env, Opts,
 };
 use crate::{
     error::{Error, Result},
@@ -79,7 +79,11 @@ impl Env {
     /// Like [`Env::load_with`], but keeps the expression index so that [`Env::reload`] can
     /// decode changed modules into the same tables. That costs about 10 bytes per expression.
     pub fn open(search: &[PathBuf], roots: &[&str], jobs: usize) -> Result<Self> {
-        Self::build(search, roots, jobs, &|_, _| {}, true, false)
+        let opts = Opts {
+            live: true,
+            ..Opts::default()
+        };
+        Self::build(search, roots, jobs, &|_, _| {}, opts)
     }
 
     /// Decode again the modules whose oleans changed since the last load, add newly imported
@@ -123,7 +127,7 @@ impl Env {
                 .collect()
         };
         let tables = self.thaw(live);
-        let decoded = decode_all(&tables, &fresh, live.jobs, &|_, _| {}, false);
+        let decoded = decode_all(&tables, &fresh, live.jobs, &|_, _| {}, false, &[], false);
         self.freeze(tables, live);
         let mut decoded: FxHashMap<usize, Module> =
             fresh.iter().map(|&(i, _)| i).zip(decoded?).collect();

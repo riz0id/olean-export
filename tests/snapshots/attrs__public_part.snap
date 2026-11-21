@@ -1,0 +1,38 @@
+---
+source: tests/attrs.rs
+expression: "entries(\"ModA\")"
+---
+Extra Lean.classExtension global OfNat
+  (0 `OfNat #[] #[])
+Extra reducibilityCore global Eq.recOn
+  (0 `Eq.recOn 0)
+Extra reducibilityCore global OfNat.casesOn
+  (0 `OfNat.casesOn 0)
+Extra reducibilityCore global OfNat.recOn
+  (0 `OfNat.recOn 0)
+Extra reducibilityCore global String.data
+  (0 `String.data 0)
+Extra reducibilityCore global instOfNatNat
+  (0 `instOfNatNat 4)
+Extra reducibilityCore global Tree.casesOn
+  (0 `Tree.casesOn 0)
+Extra reducibilityCore global PUnit.casesOn
+  (0 `PUnit.casesOn 0)
+Extra reducibilityCore global String.casesOn
+  (0 `String.casesOn 0)
+Extra reducibilityCore global List.recOn
+  (0 `List.recOn 0)
+Extra reducibilityCore global List.casesOn
+  (0 `List.casesOn 0)
+Extra reducibilityCore global Tree.recOn
+  (0 `Tree.recOn 0)
+Extra reducibilityCore global String.recOn
+  (0 `String.recOn 0)
+Extra reducibilityCore global Nat.recOn
+  (0 `Nat.recOn 0)
+Extra reducibilityCore global PUnit.recOn
+  (0 `PUnit.recOn 0)
+Extra reducibilityCore global Nat.casesOn
+  (0 `Nat.casesOn 0)
+Extra Lean.Meta.instanceExtension global ?
+  (0 (0 #[(4 `OfNat 2) (4 `Nat 0) 0] (4 `instOfNatNat 0 | [8, 233, 0, 18, 0, 0, 0, 0]) 1000 (1 `instOfNatNat) #[] | [0, 0, 0, 0, 0, 0, 0, 0]))
