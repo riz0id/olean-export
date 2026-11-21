@@ -1,4 +1,7 @@
-use crate::error::{at, corrupt, Error, Result};
+use crate::{
+    env::OleanLevel,
+    error::{at, corrupt, Error, Result},
+};
 use memmap2::{Mmap, MmapOptions};
 use std::{fs::File, ops::RangeInclusive, path::Path, str};
 
@@ -64,6 +67,8 @@ pub(crate) struct Image {
     pub(crate) root: u64,
     /// The root of the first part, which lists what the module exports.
     pub(crate) public: u64,
+    /// The root of each part in order: public, then server and private in the module system.
+    pub(crate) roots: Vec<u64>,
 }
 
 /// The Lean releases whose object layouts this reader has been checked against.
@@ -80,6 +85,7 @@ impl Image {
             header: Header::default(),
             root: 0,
             public: 0,
+            roots: Vec::new(),
         };
         img.push_part(path, true)?;
         Ok(img)
@@ -99,6 +105,7 @@ impl Image {
             header: Header::default(),
             root: 0,
             public: 0,
+            roots: Vec::new(),
         };
         img.push_part(path, eager)?;
         if img.scalar_u8(img.root, 0).map_err(at(path))? == 1 {
@@ -117,6 +124,7 @@ impl Image {
             header: Header::default(),
             root: 0,
             public: 0,
+            roots: Vec::new(),
         };
         img.map(path, false).map_err(at(path))?;
         Ok(img)
@@ -166,12 +174,24 @@ impl Image {
         };
         let base = le64(&bytes[80..88]);
         self.root = le64(&bytes[88..96]);
+        self.roots.push(self.root);
         if self.parts.is_empty() {
             self.public = self.root;
         }
         let slot = self.slots();
         self.parts.push(Part { base, slot, bytes });
         Ok(())
+    }
+
+    /// The root that lists the extension entries `level` sees. A module outside the module
+    /// system has one part, which every level sees.
+    pub(crate) fn root_of(&self, level: OleanLevel) -> u64 {
+        let i = match level {
+            OleanLevel::Public => 0,
+            OleanLevel::Server => 1,
+            OleanLevel::Private => 2,
+        };
+        self.roots.get(i).copied().unwrap_or(self.root)
     }
 
     /// One past the largest slot, where every 8-byte aligned object address has a slot.

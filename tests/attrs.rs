@@ -1,4 +1,4 @@
-use olean_export::{Attrs, Env, Error, Exporter, Scope, Value, ValueId};
+use olean_export::{Attrs, Env, Error, Exporter, OleanLevel, Scope, Value, ValueId};
 use std::{fmt::Write as _, path::PathBuf, slice};
 
 const WANTED: &[&str] = &[
@@ -211,4 +211,38 @@ fn lazy_parallel_error_keeps_env() {
     assert!(env.names.len() >= names);
     let good = env.attrs_of(m, &[(0, 0..len)]).unwrap();
     assert_eq!(good.entries.len(), len);
+}
+
+#[test]
+fn server_level_has_decl_ranges() {
+    let build = build();
+    let search = slice::from_ref(&build);
+    let ranges = &["Lean.declRangeExt"];
+    let count = |env: &Env| {
+        let m = env.modules.iter().position(|m| m == "ModA").unwrap();
+        env.attrs[m].entries.len()
+    };
+    let public = Env::load_attrs(search, &["ModA"], ranges, 1, &|_, _| {}).unwrap();
+    assert_eq!(
+        count(&public),
+        0,
+        "a module keeps its ranges out of its public part"
+    );
+    let server =
+        Env::load_attrs_at(search, &["ModA"], ranges, OleanLevel::Server, 1, &|_, _| {}).unwrap();
+    assert!(count(&server) > 0);
+    let legacy =
+        Env::load_attrs_at(search, &["Base"], ranges, OleanLevel::Server, 1, &|_, _| {}).unwrap();
+    let plain = Env::load_attrs(search, &["Base"], ranges, 1, &|_, _| {}).unwrap();
+    assert_eq!(legacy.attrs[0].entries.len(), plain.attrs[0].entries.len());
+
+    let mut lazy =
+        Env::load_attrs_lazy_at(search, &["ModA"], ranges, OleanLevel::Server, 1, &|_, _| {})
+            .unwrap();
+    let m = lazy.modules.iter().position(|m| m == "ModA").unwrap();
+    let len = lazy.entries[m][0].len;
+    assert_eq!(
+        lazy.attrs_of(m, &[(0, 0..len)]).unwrap().entries.len(),
+        count(&server)
+    );
 }

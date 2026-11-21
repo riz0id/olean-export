@@ -8,6 +8,7 @@
 - Add `Env::fetch_proofs` and `Env::fetch_cone`, to decode proofs `Env::load_cone` left in their oleans; both refuse an olean changed since the load.
 - Exporting a proof still in its olean fails with `Error::Unfetched`, naming the theorem.
 - Lazy loads (`load_statements`, `load_attrs_lazy`) and lazy theorem fetches read olean pages on demand rather than up front.
+- Add `OleanLevel`, `Env::load_attrs_at` and `Env::load_attrs_lazy_at`, to read extension entries a module in the module system keeps out of its public part, such as `Lean.declRangeExt`.
 
 ## 0.7.0 (2026-11-17)
 

@@ -26,6 +26,19 @@ pub enum Value {
     },
 }
 
+/// Which part of a module in the module system to read extension entries from, as Lean's
+/// `OLeanLevel`. A module outside the module system has one part, which every level sees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OleanLevel {
+    /// What a plain `import` sees, in the `.olean`.
+    #[default]
+    Public,
+    /// What the editor sees, in the `.olean.server`: adds declaration ranges and docstrings.
+    Server,
+    /// Everything, private declarations included, in the `.olean.private`.
+    Private,
+}
+
 /// Where an attribute applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -53,12 +66,13 @@ pub struct Entries {
     pub attr: usize,
     /// How many entries there are.
     pub len: usize,
-    /// The address of the entries array in the module's public part.
+    /// The address of the entries array, in the part of `level`.
     pub(super) at: u64,
+    pub(super) level: OleanLevel,
 }
 
 /// The entries one module exports for the whitelisted extensions, in the order the olean
-/// holds them. For a module in the module system they are those of its public part.
+/// holds them. For a module in the module system they are those of the level asked for.
 #[derive(Debug, Clone, Default)]
 pub struct Attrs {
     pub entries: Vec<Attr>,

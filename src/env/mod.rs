@@ -5,7 +5,7 @@ mod table;
 mod term;
 mod walk;
 
-pub use attr::{Attr, Attrs, Entries, Scope, Value, ValueId};
+pub use attr::{Attr, Attrs, Entries, OleanLevel, Scope, Value, ValueId};
 pub use reload::Reload;
 pub use table::{Exprs, Table};
 pub use term::{
@@ -56,6 +56,8 @@ pub(super) struct Opts<'a> {
     pub(super) attrs: &'a [&'a str],
     /// Only find where their entries are, for [`Env::attrs_of`].
     pub(super) index: bool,
+    /// Which part of each module to read the entries from.
+    pub(super) level: OleanLevel,
 }
 
 /// Every constant reachable from a set of root modules, in import order.
@@ -225,6 +227,43 @@ impl Env {
         Self::build(search, roots, jobs, progress, opts)
     }
 
+    /// Like [`Env::load_attrs`], reading the entries `level` sees. [`OleanLevel::Server`]
+    /// adds what Lean keeps for the editor, such as `Lean.declRangeExt` and
+    /// `Lean.docStringExt`, which a module in the module system leaves out of its public part.
+    pub fn load_attrs_at(
+        search: &[PathBuf],
+        roots: &[&str],
+        attrs: &[&str],
+        level: OleanLevel,
+        jobs: usize,
+        progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Self> {
+        let opts = Opts {
+            attrs,
+            level,
+            ..Opts::default()
+        };
+        Self::build(search, roots, jobs, progress, opts)
+    }
+
+    /// Like [`Env::load_attrs_lazy`], finding the entries `level` sees.
+    pub fn load_attrs_lazy_at(
+        search: &[PathBuf],
+        roots: &[&str],
+        attrs: &[&str],
+        level: OleanLevel,
+        jobs: usize,
+        progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Self> {
+        let opts = Opts {
+            attrs,
+            index: true,
+            level,
+            ..Opts::default()
+        };
+        Self::build(search, roots, jobs, progress, opts)
+    }
+
     /// Like [`Env::load_attrs`], but only finding where each module keeps the entries, into
     /// [`Env::entries`], to decode as needed with [`Env::attrs_of`]. That costs about as
     /// much as a load without them.
@@ -336,9 +375,7 @@ impl Env {
             exprs: SharedExprs::new(estimate(64)),
         };
         let paths: Vec<_> = found.iter().map(|(_, p)| p.as_path()).enumerate().collect();
-        let decoded = decode_all(
-            &tables, &paths, jobs, progress, opts.lazy, opts.attrs, opts.index,
-        );
+        let decoded = decode_all(&tables, &paths, jobs, progress, opts);
         let (exprs, index, ranks) = tables.exprs.freeze();
         let kept = opts.live.then_some((index, ranks));
         let mut decoded = decoded?;

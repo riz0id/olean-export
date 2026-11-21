@@ -1,5 +1,5 @@
 use super::{
-    attr::{Attr, Attrs, Entries, Value, ValueId},
+    attr::{Attr, Attrs, Entries, OleanLevel, Value, ValueId},
     escape,
     reload::{stamp, Live},
     table::Tables,
@@ -7,7 +7,7 @@ use super::{
         Binder, Body, Const, Ctor, Defn, Expr, ExprId, Hints, Id, Inductive, Kind, LetNode, Level,
         LevelId, Name, NameId, QuotKind, Rec, Rule, Theorem, Univs, ANON, ZERO,
     },
-    Env,
+    Env, Opts,
 };
 use crate::{
     error::{at, corrupt, Error, Result},
@@ -62,31 +62,34 @@ fn decode(
     rank: u32,
     cursor: &mut Option<usize>,
     path: &Path,
-    lazy: bool,
-    attrs: &[&str],
-    index: bool,
+    opts: Opts<'_>,
 ) -> Result<Module> {
+    let Opts {
+        lazy,
+        attrs,
+        index,
+        level,
+        ..
+    } = opts;
     // A lazy or index-only decode leaves theorem values or extension entries unread, so it
     // reads pages as it touches them rather than the whole module up front. The image is
     // unmapped on return, so a load on `jobs` threads maps at most `jobs` modules at once.
     let img = Image::open_module_with(path, !lazy && !index)?;
     let mut dec = Decoder::new(&img, tables, rank, cursor, lazy);
-    dec.run(attrs, index).map_err(at(path))?;
+    dec.run(attrs, level, index).map_err(at(path))?;
     dec.module.imports = img.imports().map_err(at(path))?;
     Ok(dec.module)
 }
 
 /// Decode the modules at `paths`, each with its rank in import order, on `jobs` threads,
-/// along with the entries of the environment extensions named in `attrs`, or with only
-/// where they are if `index`.
+/// along with the entries `opts.level` sees of the environment extensions named in
+/// `opts.attrs`, or with only where they are if `opts.index`.
 pub(super) fn decode_all(
     tables: &Tables,
     paths: &[(usize, &Path)],
     jobs: usize,
     progress: &(dyn Fn(usize, usize) + Sync),
-    lazy: bool,
-    attrs: &[&str],
-    index: bool,
+    opts: Opts<'_>,
 ) -> Result<Vec<Module>> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs.max(1))
@@ -99,7 +102,7 @@ pub(super) fn decode_all(
                 || None,
                 |cursor, &(rank, path)| {
                     let rank = u32::try_from(rank).expect("module count");
-                    let m = decode(tables, rank, cursor, path, lazy, attrs, index)?;
+                    let m = decode(tables, rank, cursor, path, opts)?;
                     let n = consts.fetch_add(m.consts.len(), Relaxed) + m.consts.len();
                     progress(done.fetch_add(1, Relaxed) + 1, n);
                     Ok(m)
@@ -238,7 +241,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn run(&mut self, attrs: &[&str], index: bool) -> Result<()> {
+    fn run(&mut self, attrs: &[&str], level: OleanLevel, index: bool) -> Result<()> {
         let img = self.img;
         for c in img.array(img.field(img.root, 2)?)? {
             self.constant(c)?;
@@ -248,20 +251,20 @@ impl<'a> Decoder<'a> {
         }
         if !attrs.is_empty() {
             if index {
-                self.attr_index(attrs)?;
+                self.attr_index(attrs, level)?;
             } else {
-                self.attrs(attrs)?;
+                self.attrs(attrs, level)?;
             }
         }
         Ok(())
     }
 
-    /// The extensions the module exports entries for that are named in `wanted`, each as its
-    /// index there and the address of its entries array.
-    fn extensions(&self, wanted: &[&str]) -> Result<Vec<(usize, u64)>> {
+    /// The extensions `level` sees entries for that are named in `wanted`, each as its index
+    /// there and the address of its entries array.
+    fn extensions(&self, wanted: &[&str], level: OleanLevel) -> Result<Vec<(usize, u64)>> {
         let img = self.img;
         let mut found = Vec::new();
-        for ext in img.array(img.field(img.public, 4)?)? {
+        for ext in img.array(img.field(img.root_of(level), 4)?)? {
             let name = img.field(ext, 0)?;
             for (i, w) in wanted.iter().enumerate() {
                 if img.name_is(name, w)? {
@@ -273,11 +276,11 @@ impl<'a> Decoder<'a> {
         Ok(found)
     }
 
-    /// The entries the module exports for the environment extensions named in `wanted`.
-    fn attrs(&mut self, wanted: &[&str]) -> Result<()> {
+    /// The entries `level` sees for the environment extensions named in `wanted`.
+    fn attrs(&mut self, wanted: &[&str], level: OleanLevel) -> Result<()> {
         let img = self.img;
         let (mut memo, mut names) = (FxHashMap::default(), FxHashMap::default());
-        for (attr, entries) in self.extensions(wanted)? {
+        for (attr, entries) in self.extensions(wanted, level)? {
             for e in img.array(entries)? {
                 self.entry(attr, e, &mut memo, &mut names)?;
             }
@@ -286,10 +289,15 @@ impl<'a> Decoder<'a> {
     }
 
     /// Where the module keeps the entries of the extensions named in `wanted`, decoding none.
-    fn attr_index(&mut self, wanted: &[&str]) -> Result<()> {
-        for (attr, at) in self.extensions(wanted)? {
+    fn attr_index(&mut self, wanted: &[&str], level: OleanLevel) -> Result<()> {
+        for (attr, at) in self.extensions(wanted, level)? {
             let len = usize::try_from(self.img.u64(at + 8)?).map_err(corrupt)?;
-            self.module.index.push(Entries { attr, len, at });
+            self.module.index.push(Entries {
+                attr,
+                len,
+                at,
+                level,
+            });
         }
         Ok(())
     }
@@ -759,14 +767,19 @@ impl<'a> Decoder<'a> {
     }
 }
 
-/// Decode the entries `want` of the module at `path`, from its public part alone.
+/// Decode the entries `want` of the module at `path`, from its public part alone when that
+/// is all they need, and otherwise from every part, paged in as touched.
 pub(super) fn decode_attr_ranges(
     tables: &Tables,
     path: &Path,
     rank: u32,
     want: &[(Entries, Range<usize>)],
 ) -> Result<Attrs> {
-    let img = Image::open_public(path)?;
+    let img = if want.iter().all(|(e, _)| e.level == OleanLevel::Public) {
+        Image::open_public(path)?
+    } else {
+        Image::open_module_with(path, false)?
+    };
     let mut cursor = None;
     let mut dec = Decoder::values(&img, tables, rank, &mut cursor);
     dec.attr_ranges(want).map_err(at(path))?;

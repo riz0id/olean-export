@@ -29,7 +29,8 @@ pub use compare::{compare, Diff};
 pub use env::{
     resolve, search_path, Attr, AttrRequest, Attrs, Binder, Body, Const, Ctor, Defn, Entries, Env,
     Expr, ExprId, Exprs, Hints, Id, Inductive, Kind, LetNode, Level, LevelId, Name, NameId,
-    QuotKind, Rec, Reload, Rule, Scope, Table, Theorem, Univs, UnivsId, Value, ValueId, ANON, ZERO,
+    OleanLevel, QuotKind, Rec, Reload, Rule, Scope, Table, Theorem, Univs, UnivsId, Value, ValueId,
+    ANON, ZERO,
 };
 pub use error::{Error, Result};
 pub use export::{Exporter, Mark, Visibility};

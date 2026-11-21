@@ -156,7 +156,7 @@ impl Env {
                 .collect()
         };
         let tables = self.thaw(live);
-        let decoded = decode_all(&tables, &fresh, live.jobs, &|_, _| {}, false, &[], false);
+        let decoded = decode_all(&tables, &fresh, live.jobs, &|_, _| {}, Opts::default());
         self.freeze(tables, live);
         let mut decoded: FxHashMap<usize, Module> =
             fresh.iter().map(|&(i, _)| i).zip(decoded?).collect();
