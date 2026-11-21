@@ -32,7 +32,7 @@ pub use env::{
     QuotKind, Rec, Reload, Rule, Scope, Table, Theorem, Univs, UnivsId, Value, ValueId, ANON, ZERO,
 };
 pub use error::{Error, Result};
-pub use export::{Exporter, Mark};
+pub use export::{Exporter, Mark, Visibility};
 pub use info::Info;
 pub use inspect::{Decl, Import, Section, Summary};
 pub use olean::{Header, SUPPORTED};

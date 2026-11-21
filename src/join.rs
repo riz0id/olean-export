@@ -2,19 +2,23 @@
 
 use crate::{
     blean::{self, Blean},
-    error::{corrupt, Result},
+    error::{corrupt, Error, Result},
     ndjson::{self, Ndjson},
     record::{Counts, Record, Sink, Table},
-    Env, Exporter,
+    Env, Exporter, Visibility,
 };
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use std::{
     cell::OnceCell,
+    cmp::Reverse,
+    collections::BinaryHeap,
     fs::File,
-    io::{BufWriter, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    thread,
 };
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -388,54 +392,95 @@ pub fn join_in<S: Sink>(
     sink.finish()
 }
 
-/// Hashes what it writes.
-struct Hashing<W> {
-    inner: W,
+/// Hashes what it writes, to a file, or to nowhere as the stand-in an exporter holds
+/// between files.
+struct Out {
+    inner: Option<BufWriter<File>>,
     hash: blake3::Hasher,
 }
 
-impl<W: Write> Write for Hashing<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
+impl Out {
+    fn create(p: &Path) -> Result<Self> {
+        Ok(Self {
+            inner: Some(BufWriter::with_capacity(1 << 20, File::create(p)?)),
+            hash: blake3::Hasher::new(),
+        })
+    }
+
+    fn nowhere() -> Self {
+        Self {
+            inner: None,
+            hash: blake3::Hasher::new(),
+        }
+    }
+}
+
+impl Write for Out {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = match &mut self.inner {
+            Some(w) => w.write(buf)?,
+            None => buf.len(),
+        };
         self.hash.update(&buf[..n]);
         Ok(n)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.as_mut().map_or(Ok(()), Write::flush)
     }
 }
 
-type Out = Hashing<BufWriter<File>>;
-
 /// Export every module of `env` to its own file in `dir`, named after the module.
 ///
-/// Ids count from the start in each file. A file holds every constant its module declares and
-/// refers to its imports' constants by name, so joining the files gives a whole export,
-/// up to numbering and order, plus the internal constants nothing needs. Returns the files in module order.
+/// Ids count from the start in each file. A file holds every constant its module declares
+/// and refers to its imports' constants by name, so joining the files gives a whole export,
+/// up to numbering and order, plus the internal constants nothing needs. Returns the files
+/// in module order.
 pub fn split(env: &Env, dir: &Path, blean: bool) -> Result<Vec<PathBuf>> {
-    split_each(env, dir, blean, false, &|| {})
+    split_each(env, dir, blean, false, 1, &|| {})
 }
 
 /// Like [`split`], with each module written against what the module system shows it and
 /// its interface in `dir/public`.
 pub fn split_interfaces(env: &Env, dir: &Path, blean: bool) -> Result<Vec<PathBuf>> {
-    split_each(env, dir, blean, true, &|| {})
+    split_each(env, dir, blean, true, 1, &|| {})
 }
 
-/// [`split`] or [`split_interfaces`], calling `each` after every file written.
+/// [`split`] or [`split_interfaces`], writing on `jobs` threads and calling `each` after
+/// every file written. The files are the same for any `jobs`.
 pub fn split_each(
     env: &Env,
     dir: &Path,
     blean: bool,
     interfaces: bool,
-    each: &dyn Fn(),
+    jobs: usize,
+    each: &(dyn Fn() + Sync),
 ) -> Result<Vec<PathBuf>> {
     if blean {
-        split_with(env, dir, "blean", interfaces, Blean::new, each)
+        split_with(env, dir, "blean", interfaces, jobs, Blean::new, each)
     } else {
-        split_with(env, dir, "ndjson", interfaces, Ndjson::new, each)
+        split_with(env, dir, "ndjson", interfaces, jobs, Ndjson::new, each)
     }
+}
+
+/// One file of a per-module export: its module, whether it is the module's interface,
+/// where it goes, the files whose hashes its meta names for each import it lists, and for
+/// a module with an interface file, that file.
+struct Job {
+    module: usize,
+    interface: bool,
+    path: PathBuf,
+    imports: Vec<(usize, usize)>,
+    shown: Option<usize>,
+}
+
+/// The files ready to write, lowest first so that files go out near module order, and
+/// how many imports each other file still waits on.
+struct Queue {
+    ready: BinaryHeap<Reverse<usize>>,
+    waiting: Vec<usize>,
+    left: usize,
+    failed: Option<Error>,
 }
 
 fn split_with<S: Sink<Output = Out>>(
@@ -443,8 +488,9 @@ fn split_with<S: Sink<Output = Out>>(
     dir: &Path,
     ext: &str,
     interfaces: bool,
-    sink: impl Fn(Out) -> S,
-    each: &dyn Fn(),
+    jobs: usize,
+    sink: impl Fn(Out) -> S + Sync,
+    each: &(dyn Fn() + Sync),
 ) -> Result<Vec<PathBuf>> {
     let public = dir.join("public");
     std::fs::create_dir_all(if interfaces { &public } else { dir })?;
@@ -453,83 +499,185 @@ fn split_with<S: Sink<Output = Out>>(
         .iter()
         .map(|m| dir.join(format!("{m}.{ext}")))
         .collect();
-    let files: Vec<(usize, bool, PathBuf)> = (0..paths.len())
-        .flat_map(|m| {
-            let shown = (interfaces && env.exported[m].is_some())
-                .then(|| (m, true, public.join(format!("{}.{ext}", env.modules[m]))));
-            shown.into_iter().chain([(m, false, paths[m].clone())])
-        })
-        .collect();
-    let open = |p: &Path| -> Result<S> {
-        Ok(sink(Hashing {
-            inner: BufWriter::with_capacity(1 << 20, File::create(p)?),
-            hash: blake3::Hasher::new(),
-        }))
-    };
-    let Some((_, _, first)) = files.first() else {
+    let files = jobs_of(env, &paths, &public, ext, interfaces)?;
+    if files.is_empty() {
         return Ok(paths);
+    }
+    // A file's meta names the hashes of the files it lists, so it waits on them.
+    let mut dependents = vec![Vec::new(); files.len()];
+    let mut waiting = vec![0; files.len()];
+    for (k, f) in files.iter().enumerate() {
+        for d in f.imports.iter().map(|&(_, d)| d).chain(f.shown) {
+            dependents[d].push(k);
+            waiting[k] += 1;
+        }
+    }
+    let ready = (0..files.len())
+        .filter(|&k| waiting[k] == 0)
+        .map(Reverse)
+        .collect();
+    let queue = Mutex::new(Queue {
+        ready,
+        waiting,
+        left: files.len(),
+        failed: None,
+    });
+    let wake = Condvar::new();
+    let hashes: Vec<OnceLock<String>> = files.iter().map(|_| OnceLock::new()).collect();
+    let vis = Arc::new(Visibility::new(env, interfaces));
+    // Each thread keeps one exporter for every file it writes, so its tables are allocated
+    // once, and holds one open file at a time.
+    let work = || {
+        let mut ex: Option<Exporter<'_, S>> = None;
+        loop {
+            let k = {
+                let mut q = queue.lock().expect("queue");
+                loop {
+                    if q.failed.is_some() || q.left == 0 {
+                        return;
+                    }
+                    if let Some(Reverse(k)) = q.ready.pop() {
+                        break k;
+                    }
+                    q = wake.wait(q).expect("queue");
+                }
+            };
+            let done = write(env, &files[k], &hashes, &mut ex, &sink, &vis);
+            let mut q = queue.lock().expect("queue");
+            match done {
+                Ok(h) => {
+                    hashes[k].set(h).expect("written once");
+                    each();
+                    q.left -= 1;
+                    for &d in &dependents[k] {
+                        q.waiting[d] -= 1;
+                        if q.waiting[d] == 0 {
+                            q.ready.push(Reverse(d));
+                        }
+                    }
+                }
+                Err(e) => {
+                    q.failed.get_or_insert(e);
+                }
+            }
+            drop(q);
+            wake.notify_all();
+        }
     };
+    thread::scope(|s| {
+        for _ in 1..jobs.clamp(1, files.len()) {
+            s.spawn(work);
+        }
+        work();
+    });
+    let q = queue.into_inner().expect("queue");
+    q.failed.map_or(Ok(paths), Err)
+}
+
+/// The files of a per-module export, in the order a single thread writes them: for each
+/// module, its interface file if it has one, then its own.
+fn jobs_of(
+    env: &Env,
+    paths: &[PathBuf],
+    public: &Path,
+    ext: &str,
+    interfaces: bool,
+) -> Result<Vec<Job>> {
     let index: FxHashMap<&str, usize> = env
         .modules
         .iter()
         .enumerate()
         .map(|(i, m)| (m.as_str(), i))
         .collect();
-    let mut whole: Vec<String> = Vec::with_capacity(paths.len());
-    let mut shown: Vec<Option<String>> = vec![None; paths.len()];
-    let mut ex = if interfaces {
-        Exporter::restricted(env, open(first)?)
-    } else {
-        Exporter::per_module(env, open(first)?)
-    };
-    for (k, (m, interface, _)) in files.iter().enumerate() {
-        let (m, name) = (*m, &env.modules[*m]);
+    let (mut whole, mut shown) = (Vec::with_capacity(paths.len()), vec![None; paths.len()]);
+    let mut files = Vec::new();
+    for (m, path) in paths.iter().enumerate() {
+        let name = &env.modules[m];
         let module = interfaces && env.exported[m].is_some();
-        let imports = env.imports[m]
-            .iter()
-            .filter(|i| !interface || i.exported)
-            .map(|i| {
-                let j = (index.get(i.module.as_str()).copied())
-                    .filter(|&j| j < whole.len())
-                    .ok_or_else(|| corrupt(format!("{name} imports unloaded {}", i.module)))?;
-                let seen = shown[j]
-                    .as_ref()
-                    .filter(|_| module && (*interface || !i.all));
-                Ok(serde_json::json!({
-                    "name": i.module,
-                    "blake3": seen.unwrap_or(&whole[j]),
-                    "all": i.all,
-                    "public": i.exported,
-                    "meta": i.meta,
-                }))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut meta = serde_json::json!({"name": name, "imports": imports});
-        if *interface {
-            meta["public"] = true.into();
-            meta["inside"] = ex.inside(m).map(|o| env.modules[o].as_str()).collect();
-            ex.meta_with(Some(meta))?;
-            ex.interface(m)?;
-        } else {
-            if let Some(h) = &shown[m] {
-                meta["interface"] = h.as_str().into();
+        for interface in [true, false].into_iter().filter(|&i| module || !i) {
+            let imports = env.imports[m]
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| !interface || i.exported)
+                .map(|(n, i)| {
+                    let j = (index.get(i.module.as_str()).copied())
+                        .filter(|&j| j < m)
+                        .ok_or_else(|| corrupt(format!("{name} imports unloaded {}", i.module)))?;
+                    let seen = shown[j].filter(|_| module && (interface || !i.all));
+                    Ok((n, seen.unwrap_or(whole[j])))
+                })
+                .collect::<Result<_>>()?;
+            let path = if interface {
+                public.join(format!("{name}.{ext}"))
+            } else {
+                path.clone()
+            };
+            let k = files.len();
+            files.push(Job {
+                module: m,
+                interface,
+                path,
+                imports,
+                shown: if interface { None } else { shown[m] },
+            });
+            if interface {
+                shown[m] = Some(k);
+            } else {
+                whole.push(k);
             }
-            ex.meta_with(Some(meta))?;
-            ex.module(m)?;
-        }
-        each();
-        let Some((_, _, next)) = files.get(k + 1) else {
-            break;
-        };
-        let mut out = ex.split(open(next)?)?;
-        out.flush()?;
-        let h = out.hash.finalize().to_hex().to_string();
-        if *interface {
-            shown[m] = Some(h);
-        } else {
-            whole.push(h);
         }
     }
-    ex.finish()?.flush()?;
-    Ok(paths)
+    Ok(files)
+}
+
+/// Write one file with `ex`, creating it on first use, and return the file's hash. The
+/// files `f` names must have been written.
+fn write<'a, S: Sink<Output = Out>>(
+    env: &'a Env,
+    f: &Job,
+    hashes: &[OnceLock<String>],
+    ex: &mut Option<Exporter<'a, S>>,
+    sink: &impl Fn(Out) -> S,
+    vis: &Arc<Visibility>,
+) -> Result<String> {
+    let hash = |k: usize| hashes[k].get().expect("written before").as_str();
+    let m = f.module;
+    let imports: Vec<Value> = f
+        .imports
+        .iter()
+        .map(|&(n, k)| {
+            let i = &env.imports[m][n];
+            serde_json::json!({
+                "name": i.module,
+                "blake3": hash(k),
+                "all": i.all,
+                "public": i.exported,
+                "meta": i.meta,
+            })
+        })
+        .collect();
+    let out = sink(Out::create(&f.path)?);
+    let ex = match ex {
+        Some(ex) => {
+            ex.split(out)?;
+            ex
+        }
+        None => ex.insert(Exporter::with_visibility(env, out, Arc::clone(vis))),
+    };
+    let mut meta = serde_json::json!({"name": env.modules[m], "imports": imports});
+    if f.interface {
+        meta["public"] = true.into();
+        meta["inside"] = ex.inside(m).map(|o| env.modules[o].as_str()).collect();
+        ex.meta_with(Some(meta))?;
+        ex.interface(m)?;
+    } else {
+        if let Some(k) = f.shown {
+            meta["interface"] = hash(k).into();
+        }
+        ex.meta_with(Some(meta))?;
+        ex.module(m)?;
+    }
+    let mut out = ex.split(sink(Out::nowhere()))?;
+    out.flush()?;
+    Ok(out.hash.finalize().to_hex().to_string())
 }

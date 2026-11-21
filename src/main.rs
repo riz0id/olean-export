@@ -365,7 +365,7 @@ fn per_module(cli: &Cli, env: &Env, dir: &Path, start: Instant) -> Res {
         "{spinner:.cyan} writing [{elapsed}] [{bar:30.cyan/blue}] {human_pos}/{human_len} files",
     );
     let blean = cli.format == Format::Blean;
-    let files = split_each(env, dir, blean, cli.interfaces, &|| pb.inc(1))?;
+    let files = split_each(env, dir, blean, cli.interfaces, jobs(cli), &|| pb.inc(1))?;
     pb.finish_and_clear();
     if !cli.quiet {
         eprintln!(

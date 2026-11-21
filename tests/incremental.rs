@@ -45,6 +45,54 @@ fn per_module_join_is_the_whole_export() {
     }
 }
 
+/// Every file under `dir`, by its path from `dir`, with its bytes.
+fn tree(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                out.push((
+                    p.strip_prefix(dir).unwrap().to_path_buf(),
+                    fs::read(&p).unwrap(),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A per-module export writes the same files on any number of threads, including the
+/// hashes each file's meta names of the files it imports.
+#[test]
+fn per_module_parallel_matches_serial() {
+    let build = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/build");
+    let roots = [
+        "Top", "Extra", "Pinned", "ModA", "ModB", "ModC", "ModD", "ModZ",
+    ];
+    let env = Env::load(&[build], &roots).unwrap();
+    for interfaces in [false, true] {
+        for blean in [false, true] {
+            let trees: Vec<_> = [1, 4, 16]
+                .into_iter()
+                .map(|jobs| {
+                    let dir = tempfile::tempdir().unwrap();
+                    let files = join::split_each(&env, dir.path(), blean, interfaces, jobs, &|| {})
+                        .unwrap();
+                    assert_eq!(files.len(), env.modules.len());
+                    tree(dir.path())
+                })
+                .collect();
+            assert!(trees[0].len() >= env.modules.len());
+            assert!(trees.iter().all(|t| *t == trees[0]));
+        }
+    }
+}
+
 #[test]
 fn join_checks_imports() {
     let build = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/build");

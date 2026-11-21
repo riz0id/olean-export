@@ -66,7 +66,10 @@ fn decode(
     attrs: &[&str],
     index: bool,
 ) -> Result<Module> {
-    let img = Image::open_module(path)?;
+    // A lazy or index-only decode leaves theorem values or extension entries unread, so it
+    // reads pages as it touches them rather than the whole module up front. The image is
+    // unmapped on return, so a load on `jobs` threads maps at most `jobs` modules at once.
+    let img = Image::open_module_with(path, !lazy && !index)?;
     let mut dec = Decoder::new(&img, tables, rank, cursor, lazy);
     dec.run(attrs, index).map_err(at(path))?;
     dec.module.imports = img.imports().map_err(at(path))?;
@@ -792,7 +795,7 @@ impl Env {
                             || None,
                             |cursor, group| {
                                 let path = &loaded[group[0].0 .0].path;
-                                let img = Image::open_module(path)?;
+                                let img = Image::open_module_with(path, false)?;
                                 let rank = u32::try_from(group[0].0 .0).expect("module count");
                                 let mut dec = Decoder::new(&img, &tables, rank, cursor, false);
                                 group

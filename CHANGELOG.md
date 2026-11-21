@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `--per-module` writes files on `--jobs` threads, in an order that respects import hashes; the files are unchanged.
+- `join::split_each` takes a `jobs` count, and its callback must be `Sync`.
+- Add `Visibility` and `Exporter::with_visibility`, for per-module exporters sharing one view of the modules.
+- Lazy loads (`load_statements`, `load_attrs_lazy`) and lazy theorem fetches read olean pages on demand rather than up front.
+
 ## 0.7.0 (2026-11-17)
 
 - Add `--interfaces`, per-module exports that follow the module system.

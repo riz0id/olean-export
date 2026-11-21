@@ -81,17 +81,29 @@ impl Image {
             root: 0,
             public: 0,
         };
-        img.push_part(path)?;
+        img.push_part(path, true)?;
         Ok(img)
     }
 
     /// Open a module's `.olean`, adding its `.server` and `.private` parts if it is in the
     /// module system. The root is then the private part's, which sees all of them.
     pub(crate) fn open_module(path: &Path) -> Result<Self> {
-        let mut img = Self::open(path)?;
+        Self::open_module_with(path, true)
+    }
+
+    /// Like [`Image::open_module`], reading every part in full up front if `eager`, or
+    /// otherwise only the pages touched, for a decode that leaves much of the module unread.
+    pub(crate) fn open_module_with(path: &Path, eager: bool) -> Result<Self> {
+        let mut img = Self {
+            parts: Vec::new(),
+            header: Header::default(),
+            root: 0,
+            public: 0,
+        };
+        img.push_part(path, eager)?;
         if img.scalar_u8(img.root, 0).map_err(at(path))? == 1 {
-            img.push_part(&path.with_extension("olean.server"))?;
-            img.push_part(&path.with_extension("olean.private"))?;
+            img.push_part(&path.with_extension("olean.server"), eager)?;
+            img.push_part(&path.with_extension("olean.private"), eager)?;
         }
         Ok(img)
     }
@@ -110,8 +122,8 @@ impl Image {
         Ok(img)
     }
 
-    pub(crate) fn push_part(&mut self, path: &Path) -> Result<()> {
-        self.map(path, true).map_err(at(path))
+    pub(crate) fn push_part(&mut self, path: &Path, eager: bool) -> Result<()> {
+        self.map(path, eager).map_err(at(path))
     }
 
     /// Map the part at `path`, read in full up front if `eager`.

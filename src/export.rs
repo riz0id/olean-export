@@ -10,7 +10,7 @@ use crate::{
     },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::io::Write;
+use std::{io::Write, sync::Arc};
 
 const UNSEEN: u32 = u32::MAX;
 
@@ -69,15 +69,11 @@ pub struct Exporter<'a, S: Sink> {
 /// a module the writer does not import. So a file holds what its module declares and
 /// whatever else it needs that no import provides.
 ///
-/// Per module: `whole` are the modules it sees all of, `shown` those it sees the exports
-/// of, `public` those its own interface may refer to.
-#[derive(Debug, Default)]
+/// The modules and owners are a [`Visibility`], built once and shared by every exporter
+/// writing files of the same export.
+#[derive(Debug)]
 struct Scope {
-    owner: FxHashMap<NameId, u32>,
-    more: FxHashMap<NameId, Vec<u32>>,
-    whole: Vec<Vec<u64>>,
-    shown: Vec<Vec<u64>>,
-    public: Vec<Vec<u64>>,
+    vis: Arc<Visibility>,
     module: u32,
     interface: bool,
     names: Vec<NameId>,
@@ -96,8 +92,23 @@ fn add(bits: &mut [u64], more: &[u64], i: usize) {
     bits[i / 64] |= 1 << (i % 64);
 }
 
-impl Scope {
-    fn new(env: &Env, restricted: bool) -> Self {
+/// What each module's file sees of the others in a per-module export.
+///
+/// Which modules declare each constant, and per module, `whole` the modules it sees all of,
+/// `shown` those it sees the exports of, `public` those its own interface may refer to.
+#[derive(Debug, Default)]
+pub struct Visibility {
+    owner: FxHashMap<NameId, u32>,
+    more: FxHashMap<NameId, Vec<u32>>,
+    whole: Vec<Vec<u64>>,
+    shown: Vec<Vec<u64>>,
+    public: Vec<Vec<u64>>,
+}
+
+impl Visibility {
+    /// For [`Exporter::per_module`], or [`Exporter::restricted`] if `restricted`.
+    #[must_use]
+    pub fn new(env: &Env, restricted: bool) -> Self {
         let mut s = Self::default();
         for m in 0..env.modules.len() {
             let m32 = u32::try_from(m).expect("module count");
@@ -144,13 +155,29 @@ impl Scope {
         }
         s
     }
+}
+
+impl Scope {
+    const fn new(vis: Arc<Visibility>) -> Self {
+        Self {
+            vis,
+            module: 0,
+            interface: false,
+            names: Vec::new(),
+            levels: Vec::new(),
+            exprs: Vec::new(),
+            scanned: Vec::new(),
+            visited: Vec::new(),
+        }
+    }
 
     /// Whether the file being written writes `c`, rather than an import providing it.
     fn writes(&self, env: &Env, c: NameId) -> bool {
-        let Some(&first) = self.owner.get(&c) else {
+        let vis = &*self.vis;
+        let Some(&first) = vis.owner.get(&c) else {
             return true;
         };
-        let owners = std::iter::once(first).chain(self.more.get(&c).into_iter().flatten().copied());
+        let owners = std::iter::once(first).chain(vis.more.get(&c).into_iter().flatten().copied());
         let m = self.module as usize;
         let mut provided = false;
         for o in owners {
@@ -160,9 +187,9 @@ impl Scope {
             let o = o as usize;
             let shows = || env.exported[o].as_ref().is_none_or(|e| e.contains_key(&c));
             provided |= if self.interface {
-                has(&self.public[m], o) && shows()
+                has(&vis.public[m], o) && shows()
             } else {
-                has(&self.whole[m], o) || has(&self.shown[m], o) && shows()
+                has(&vis.whole[m], o) || has(&vis.shown[m], o) && shows()
             };
         }
         !provided
@@ -220,15 +247,19 @@ impl<'a, S: Sink> Exporter<'a, S> {
     /// own sink after [`Exporter::split`]. A module's records refer to what its imports
     /// declare by name only.
     pub fn per_module(env: &'a Env, sink: S) -> Self {
-        let mut ex = Self::with_sink(env, sink);
-        ex.scope = Some(Box::new(Scope::new(env, false)));
-        ex
+        Self::with_visibility(env, sink, Arc::new(Visibility::new(env, false)))
     }
 
     /// Like [`Exporter::per_module`], but an import provides only what Lean showed of it.
     pub fn restricted(env: &'a Env, sink: S) -> Self {
+        Self::with_visibility(env, sink, Arc::new(Visibility::new(env, true)))
+    }
+
+    /// A per-module exporter over a [`Visibility`] of `env`, which exporters writing
+    /// different files of one export, on different threads, can share.
+    pub fn with_visibility(env: &'a Env, sink: S, vis: Arc<Visibility>) -> Self {
         let mut ex = Self::with_sink(env, sink);
-        ex.scope = Some(Box::new(Scope::new(env, true)));
+        ex.scope = Some(Box::new(Scope::new(vis)));
         ex
     }
 
@@ -265,7 +296,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
 
     /// The modules `m` sees all of.
     pub fn inside(&self, m: usize) -> impl Iterator<Item = usize> + '_ {
-        let whole = self.scope.as_ref().map(|s| &s.whole[m]);
+        let whole = self.scope.as_ref().map(|s| &s.vis.whole[m]);
         (0..self.env.modules.len()).filter(move |&o| whole.is_some_and(|w| has(w, o)))
     }
 
@@ -279,7 +310,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
         match k.kind {
             Kind::Thm(_) => true,
             Kind::Defn(_) | Kind::Opaque(_) => {
-                let owner = s.owner.get(&k.name).map(|&o| o as usize);
+                let owner = s.vis.owner.get(&k.name).map(|&o| o as usize);
                 let shown = owner.and_then(|o| self.env.exported[o].as_ref());
                 shown.is_some_and(|e| e.get(&k.name) != Some(&false))
             }
