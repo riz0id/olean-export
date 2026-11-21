@@ -1,7 +1,7 @@
 use super::{
     attr::{Attr, Attrs, Entries, Value, ValueId},
     escape,
-    reload::Live,
+    reload::{stamp, Live},
     table::Tables,
     term::{
         Binder, Body, Const, Ctor, Defn, Expr, ExprId, Hints, Id, Inductive, Kind, LetNode, Level,
@@ -774,40 +774,45 @@ pub(super) fn decode_attr_ranges(
 }
 
 impl Env {
-    /// Decode the theorem values `due`, sorted by module, into the tables.
+    /// Decode the theorem values `due`, sorted by module, into the tables. Fails, decoding
+    /// nothing, if any of their oleans changed since the load.
     pub(super) fn decode_values(
         &mut self,
         live: &mut Live,
         due: &[((usize, u64), NameId)],
     ) -> Result<Vec<(NameId, ExprId)>> {
-        let tables = self.thaw(live);
         let groups: Vec<_> = due.chunk_by(|a, b| a.0 .0 == b.0 .0).collect();
+        for g in &groups {
+            let l = &live.loaded[g[0].0 .0];
+            if stamp(&l.path) != l.stamp {
+                return Err(at(&l.path)(Error::Misuse(
+                    "the olean changed since the load, reload it first",
+                )));
+            }
+        }
+        live.pool.get(live.jobs)?;
+        let tables = self.thaw(live);
         let loaded = &live.loaded;
-        let decoded = rayon::ThreadPoolBuilder::new()
-            .num_threads(live.jobs.max(1))
-            .build()
-            .map_err(Error::from)
-            .and_then(|pool| {
-                pool.install(|| {
-                    groups
-                        .par_iter()
-                        .map_init(
-                            || None,
-                            |cursor, group| {
-                                let path = &loaded[group[0].0 .0].path;
-                                let img = Image::open_module_with(path, false)?;
-                                let rank = u32::try_from(group[0].0 .0).expect("module count");
-                                let mut dec = Decoder::new(&img, &tables, rank, cursor, false);
-                                group
-                                    .iter()
-                                    .map(|&((_, o), n)| Ok((n, dec.expr(o)?)))
-                                    .collect::<Result<Vec<_>>>()
-                                    .map_err(at(path))
-                            },
-                        )
-                        .collect::<Result<Vec<_>>>()
-                })
-            });
+        let pool = live.pool.get(live.jobs).expect("built above");
+        let decoded = pool.install(|| {
+            groups
+                .par_iter()
+                .map_init(
+                    || None,
+                    |cursor, group| {
+                        let path = &loaded[group[0].0 .0].path;
+                        let img = Image::open_module_with(path, false)?;
+                        let rank = u32::try_from(group[0].0 .0).expect("module count");
+                        let mut dec = Decoder::new(&img, &tables, rank, cursor, false);
+                        group
+                            .iter()
+                            .map(|&((_, o), n)| Ok((n, dec.expr(o)?)))
+                            .collect::<Result<Vec<_>>>()
+                            .map_err(at(path))
+                    },
+                )
+                .collect::<Result<Vec<_>>>()
+        });
         self.freeze(tables, live);
         Ok(decoded?.into_iter().flatten().collect())
     }

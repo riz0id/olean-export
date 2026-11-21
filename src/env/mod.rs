@@ -389,6 +389,7 @@ impl Env {
             .collect();
         env.index(&loaded);
         if let Some((index, ranks)) = kept {
+            let pending = env.pending(&loaded);
             env.live = Some(Box::new(Live {
                 search: search.to_vec(),
                 roots: roots.iter().map(|&r| r.to_owned()).collect(),
@@ -396,6 +397,8 @@ impl Env {
                 index,
                 ranks,
                 loaded,
+                pending,
+                pool: reload::Pool::default(),
             }));
         }
         Ok(env)

@@ -3,7 +3,7 @@ use crate::{
         Binder, Builtins, Const, Ctor, Dep, Depth, Env, Expr, ExprId, Family, Inductive, Kind,
         LetNode, Level, LevelId, Name, NameId, Rec, Reload, ANON, ZERO,
     },
-    error::{corrupt, Error, Result},
+    error::{Error, Result},
     ndjson::Ndjson,
     record::{
         Binding, Counts, Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Safety, Sink,
@@ -646,10 +646,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
                         Dep::Unloaded(c) => unloaded = Some(c),
                     })?;
                     if let Some(c) = unloaded {
-                        return Err(corrupt(format!(
-                            "the value of {} was not loaded",
-                            env.display(c)
-                        )));
+                        return Err(Error::Unfetched(env.display(c)));
                     }
                     work[at..].reverse();
                     for c in std::mem::take(&mut members) {

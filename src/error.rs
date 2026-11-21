@@ -28,6 +28,10 @@ pub enum Error {
     /// The library was called in a way it does not support.
     #[error("{0}")]
     Misuse(&'static str),
+    /// An export reached a theorem whose proof a lazy load left in its olean, which
+    /// [`crate::Env::fetch_cone`] decodes.
+    #[error("the proof of {0} is still in its olean, fetch it first")]
+    Unfetched(String),
     /// The file is malformed, or the environment it describes is inconsistent.
     #[error("{0}")]
     Corrupt(String),

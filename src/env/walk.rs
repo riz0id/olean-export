@@ -1,9 +1,10 @@
 use super::{
+    reload::Live,
     term::{Body, Const, Ctor, Defn, Expr, ExprId, Inductive, Kind, NameId, Rec},
     Env, Opts,
 };
 use crate::error::{corrupt, Error, Result};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::{mem, path::PathBuf};
 
 /// Constants the kernel relies on without a term naming them: `Nat` for numeric literals,
@@ -91,7 +92,8 @@ impl Walk {
 
 impl Env {
     /// Like [`Env::load_with`], but decode only the theorem values that exporting `consts`
-    /// reaches. The rest stay in their oleans, as `None`.
+    /// reaches. The rest stay in their oleans, as `None`, and [`Env::fetch_cone`] or
+    /// [`Env::fetch_proofs`] decode more of them later.
     pub fn load_cone(
         search: &[PathBuf],
         roots: &[&str],
@@ -105,44 +107,94 @@ impl Env {
             ..Opts::default()
         };
         let mut env = Self::build(search, roots, jobs, progress, opts)?;
-        let mut live = env.live.take().expect("built live");
-        let mut todo = consts
+        let consts = consts
             .iter()
             .map(|c| {
                 env.find_name(c)
-                    .map(Dep::Const)
                     .ok_or_else(|| Error::UnknownConstant((*c).to_owned()))
             })
             .collect::<Result<Vec<_>>>()?;
-        let pending: FxHashMap<NameId, (usize, u64)> = live
-            .loaded
-            .iter()
-            .enumerate()
-            .flat_map(|(i, l)| l.pending.iter().map(move |&(n, o)| (n, (i, o))))
-            .collect();
+        env.fetch_cone(&consts)?;
+        Ok(env)
+    }
+
+    /// Decode every theorem value still in its olean that exporting `consts` with proofs
+    /// reaches, so that [`crate::Exporter::constant`] can write each of them. Proofs mention
+    /// further theorems, so this decodes in rounds until none is left, each round on the
+    /// load's threads.
+    ///
+    /// Fails like [`Env::fetch_proofs`]. Values decoded in earlier rounds stay.
+    pub fn fetch_cone(&mut self, consts: &[NameId]) -> Result<()> {
         let mut walk = Walk::new(Depth::Full);
+        let mut todo: Vec<Dep> = consts.iter().map(|&c| Dep::Const(c)).collect();
         loop {
-            let mut due: Vec<_> = env
-                .walk(&mut walk, todo)?
-                .into_iter()
-                .map(|n| (pending[&n], n))
-                .collect();
+            let due = self.walk(&mut walk, todo)?;
             if due.is_empty() {
-                env.live = Some(live);
-                return Ok(env);
+                return Ok(());
             }
-            due.sort_unstable_by_key(|&(p, _)| p);
-            todo = Vec::new();
-            for (n, v) in env.decode_values(&mut live, &due)? {
-                if let Some(Const {
-                    kind: Kind::Thm(t), ..
-                }) = env.consts.get_mut(&n)
-                {
-                    t.value = Some(v);
-                }
-                todo.push(Dep::Expr(v));
-            }
+            todo = self
+                .fetch_proofs(&due)?
+                .into_iter()
+                .map(|(_, v)| Dep::Expr(v))
+                .collect();
         }
+    }
+
+    /// Decode the values of the theorems among `consts` that are still in their oleans, on
+    /// the load's threads, giving each with its value. Only those values are decoded, not
+    /// the proofs they mention; [`Env::fetch_cone`] follows those too. Anything else in
+    /// `consts`, such as a theorem already decoded, is skipped.
+    ///
+    /// Fails, decoding nothing, if the environment is not from [`Env::load_cone`] or an
+    /// olean changed since the load, which [`Env::reload`] picks up.
+    pub fn fetch_proofs(&mut self, consts: &[NameId]) -> Result<Vec<(NameId, ExprId)>> {
+        let mut live = self.live.take();
+        let r = self.fetch_with(live.as_deref_mut(), consts);
+        self.live = live;
+        r
+    }
+
+    fn fetch_with(
+        &mut self,
+        live: Option<&mut Live>,
+        consts: &[NameId],
+    ) -> Result<Vec<(NameId, ExprId)>> {
+        let unfetched = consts.iter().copied().filter(|&c| self.unfetched(c));
+        let Some(live) = live else {
+            return match unfetched.count() {
+                0 => Ok(Vec::new()),
+                _ => Err(Error::Misuse("fetching proofs needs an Env::load_cone")),
+            };
+        };
+        let mut due = unfetched
+            .map(|c| live.pending.get(&c).map(|&p| (p, c)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| corrupt("a theorem value is missing from its olean"))?;
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Theorems can share one value in the olean, so only drop a name asked for twice.
+        due.sort_unstable_by_key(|&(p, n)| (p, n.index()));
+        due.dedup();
+        let decoded = self.decode_values(live, &due)?;
+        for &(n, v) in &decoded {
+            if let Some(Const {
+                kind: Kind::Thm(t), ..
+            }) = self.consts.get_mut(&n)
+            {
+                t.value = Some(v);
+            }
+            live.pending.remove(&n);
+        }
+        Ok(decoded)
+    }
+
+    /// Whether `c` is a theorem whose value is still in its olean.
+    pub(super) fn unfetched(&self, c: NameId) -> bool {
+        matches!(
+            self.consts.get(&c),
+            Some(Const { kind: Kind::Thm(t), .. }) if t.value.is_none()
+        )
     }
 
     /// Load like [`Env::load_with`], leaving every theorem value undecoded, for

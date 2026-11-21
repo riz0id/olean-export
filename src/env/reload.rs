@@ -55,6 +55,35 @@ pub(super) struct Live {
     pub(super) index: Vec<HashTable<u32>>,
     pub(super) ranks: Vec<Vec<u32>>,
     pub(super) loaded: Vec<Loaded>,
+    /// The module and olean offset of every theorem value still undecoded.
+    pub(super) pending: FxHashMap<NameId, (usize, u64)>,
+    pub(super) pool: Pool,
+}
+
+/// The threads [`Env::fetch_proofs`] decodes on, made at the first fetch.
+#[derive(Default)]
+pub(super) struct Pool(Option<rayon::ThreadPool>);
+
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Pool"
+        } else {
+            "Pool(unbuilt)"
+        })
+    }
+}
+
+impl Pool {
+    pub(super) fn get(&mut self, jobs: usize) -> Result<&rayon::ThreadPool> {
+        if self.0.is_none() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(jobs.max(1))
+                .build()?;
+            self.0 = Some(pool);
+        }
+        Ok(self.0.as_ref().expect("just built"))
+    }
 }
 
 /// What [`Env::reload`] changed.
@@ -163,11 +192,22 @@ impl Env {
             })
             .collect();
         self.index(&live.loaded);
+        live.pending = self.pending(&live.loaded);
         reload.removed = stale
             .into_iter()
             .filter(|c| !self.consts.contains_key(c))
             .collect();
         Ok(reload)
+    }
+
+    /// Where the theorem values of `loaded` that are still undecoded are.
+    pub(super) fn pending(&self, loaded: &[Loaded]) -> FxHashMap<NameId, (usize, u64)> {
+        loaded
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| l.pending.iter().map(move |&(n, o)| (n, (i, o))))
+            .filter(|(n, _)| self.unfetched(*n))
+            .collect()
     }
 
     /// Hand the tables back to shared, growable form to decode more into them.
