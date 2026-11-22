@@ -31,7 +31,10 @@ use std::{
     env, mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
+    sync::{
+        atomic::{AtomicU64, Ordering::Relaxed},
+        OnceLock,
+    },
     thread,
 };
 
@@ -89,6 +92,9 @@ pub struct Env {
     ends: Vec<usize>,
     pub(crate) lineage: u64,
     live: Option<Box<Live>>,
+    /// The threads [`Env::attrs_of_many`] decodes on, with how many there are, made on its
+    /// first call to decode on more than one.
+    pool: OnceLock<(usize, rayon::ThreadPool)>,
 }
 
 /// Identifier-shaped tokens of Lean's term and command syntax, which a name must not print
@@ -303,18 +309,30 @@ impl Env {
             .map(|(m, ks)| self.request(*m, ks))
             .collect::<Result<Vec<_>>>()?;
         let tables = self.names_only();
-        let decoded = rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs.max(1))
-            .build()
-            .map_err(Error::from)
-            .and_then(|pool| {
-                pool.install(|| {
-                    requests
-                        .par_iter()
-                        .map(|(path, rank, w)| decode_attr_ranges(&tables, path, *rank, w))
-                        .collect::<Result<Vec<_>>>()
-                })
-            });
+        let decode = |(path, rank, w): &Located| decode_attr_ranges(&tables, path, *rank, w);
+        let decoded = if jobs <= 1 || requests.len() <= 1 {
+            // one thread's worth: no pool to start, or to hand the work to
+            requests.iter().map(decode).collect::<Result<Vec<_>>>()
+        } else {
+            let run = |pool: &rayon::ThreadPool| {
+                pool.install(|| requests.par_iter().map(decode).collect::<Result<Vec<_>>>())
+            };
+            let built = || {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(jobs)
+                    .build()
+                    .map_err(Error::from)
+            };
+            match self.pool.get() {
+                Some((n, pool)) if *n == jobs => run(pool),
+                Some(_) => built().and_then(|pool| run(&pool)),
+                None => built().and_then(|pool| {
+                    let got = run(&pool);
+                    let _ = self.pool.set((jobs, pool));
+                    got
+                }),
+            }
+        };
         self.names = tables.names.freeze();
         decoded
     }
@@ -417,6 +435,7 @@ impl Env {
             ends: Vec::new(),
             lineage: LINEAGE.fetch_add(1, Relaxed),
             live: None,
+            pool: OnceLock::new(),
         };
         let loaded: Vec<_> = found
             .into_iter()
