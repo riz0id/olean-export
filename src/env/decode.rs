@@ -17,9 +17,11 @@ use crate::{
         QUOT, REC, THM,
     },
 };
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::{
+    mem,
     ops::Range,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering::Relaxed},
@@ -827,6 +829,7 @@ impl Env {
             }
         }
         live.pool.get(live.jobs)?;
+        let spare = Mutex::new(mem::take(&mut live.spare));
         let tables = self.thaw(live);
         let loaded = &live.loaded;
         let pool = live.pool.get(live.jobs).expect("built above");
@@ -834,12 +837,16 @@ impl Env {
             groups
                 .par_iter()
                 .map_init(
-                    || None,
+                    || Cursor {
+                        chunk: spare.lock().pop(),
+                        spare: &spare,
+                    },
                     |cursor, group| {
                         let path = &loaded[group[0].0 .0].path;
                         let img = Image::open_module_with(path, false)?;
                         let rank = u32::try_from(group[0].0 .0).expect("module count");
-                        let mut dec = Decoder::new(&img, &tables, rank, cursor, false);
+                        let mut dec =
+                            Decoder::new(&img, &tables, rank, &mut cursor.chunk, false);
                         group
                             .iter()
                             .map(|&((_, o), n)| Ok((n, dec.expr(o)?)))
@@ -850,6 +857,22 @@ impl Env {
                 .collect::<Result<Vec<_>>>()
         });
         self.freeze(tables, live);
+        live.spare = spare.into_inner();
         Ok(decoded?.into_iter().flatten().collect())
+    }
+}
+
+/// The chunk a decoding task adds expressions to, taken from the spares of earlier fetches
+/// and handed back when the task ends, so that they fill chunks rather than each start one.
+struct Cursor<'a> {
+    chunk: Option<usize>,
+    spare: &'a Mutex<Vec<usize>>,
+}
+
+impl Drop for Cursor<'_> {
+    fn drop(&mut self) {
+        if let Some(k) = self.chunk {
+            self.spare.lock().push(k);
+        }
     }
 }

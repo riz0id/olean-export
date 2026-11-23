@@ -139,6 +139,22 @@ Peak memory:
 
 Mathlib is on Lean 4.35.0 (712,205 declarations, identical under `compare`), and the theorem is `Fin.insertNth_apply_succAbove`.
 
+### Fetching proofs
+
+`Env::fetch_proofs` on Mathlib after `Env::load_cone` with no constants (7s, 2.1 GB, 548,013 proofs pending), on 10 threads. `just bench-setup && just bench` reproduces it.
+
+| Proofs fetched                 | Calls  | Time  | Proofs/s | Peak memory added |
+| ------------------------------ | ------ | ----- | -------- | ----------------- |
+| 1                              | 1      | 3 ms  | 350      | 6 MB              |
+| 1,000                          | 1      | 0.13s | 7,800    | 32 MB             |
+| 10,000                         | 1      | 0.94s | 10,600   | 21 MB             |
+| 100,000                        | 1      | 3.6s  | 27,900   | 116 MB            |
+| All                            | 1      | 9.4s  | 58,400   | 1.0 GB            |
+| 10,000                         | 10,000 | 8.5s  | 1,180    | 0 MB              |
+| Cone of `integral_add` (17.7k) | rounds | 0.61s | 29,000   | 12 MB             |
+
+Fetching all proofs takes 60s on one thread and scales 6.3x on 10. Each call costs about 0.85 ms for the modules it touches, so batch proofs into as few calls as you can. Memory does not depend on how proofs are split into calls.
+
 ## License
 
 MIT Licensed. Copyright 2026 Stephen Diehl. See [LICENSE](LICENSE) for details.

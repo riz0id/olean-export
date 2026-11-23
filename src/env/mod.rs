@@ -454,6 +454,7 @@ impl Env {
                 ranks,
                 loaded,
                 pending,
+                spare: Vec::new(),
                 pool: reload::Pool::default(),
             }));
         }

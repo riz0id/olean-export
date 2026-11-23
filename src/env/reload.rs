@@ -57,6 +57,8 @@ pub(super) struct Live {
     pub(super) loaded: Vec<Loaded>,
     /// The module and olean offset of every theorem value still undecoded.
     pub(super) pending: FxHashMap<NameId, (usize, u64)>,
+    /// Expression chunks earlier fetches left partly filled, for later ones to fill on.
+    pub(super) spare: Vec<usize>,
     pub(super) pool: Pool,
 }
 

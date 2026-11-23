@@ -71,3 +71,7 @@ tempfile = "3.27.0"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+[[bench]]
+name = "fetch_proofs"
+harness = false

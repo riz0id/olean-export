@@ -3,3 +3,4 @@
 examples/build/
 result
 result-*
+bench/.lake/

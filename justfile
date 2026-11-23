@@ -37,3 +37,12 @@ kernel checker="nl-fast":
         ./target/release/olean-export statement -L tests/cases/build -f ndjson \
             -c "${c#*:}" "${c%%:*}" | {{checker}} -
     done
+
+# Fetch Mathlib's prebuilt oleans into bench/, for `just bench`.
+bench-setup:
+    cd bench && lake exe cache get
+
+# Benchmark Env::fetch_proofs on all of Mathlib, e.g. `just bench --quick --csv`. Only
+# LEAN_PATH comes from `lake env`: its library path points rustc at Lean's LLVM.
+bench *args:
+    LEAN_PATH="$(cd bench && lake env printenv LEAN_PATH)" cargo bench --bench fetch_proofs -- {{args}}
