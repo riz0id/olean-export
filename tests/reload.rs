@@ -66,7 +66,26 @@ fn reload_writes_only_the_changed_module() {
     assert_eq!(r.modules, ["Top"]);
     let removed: Vec<_> = r.removed.iter().map(|&c| env.display(c)).collect();
     assert_eq!(removed, ["letty"]);
-    assert_eq!(full(&env), full(&Env::load(&search, &["Top"]).unwrap()));
+    let fresh = Env::load(&search, &["Top"]).unwrap();
+    assert_eq!(full(&env), full(&fresh));
+    // each constant's own binders are those of a fresh load, whatever its shared type has
+    let binders = |e: &Env| {
+        let mut all: Vec<_> = e
+            .consts
+            .values()
+            .map(|c| {
+                let bs: Vec<_> = c
+                    .binders
+                    .iter()
+                    .map(|&(n, bi)| (e.display(n), bi))
+                    .collect();
+                (e.display(c.name), bs)
+            })
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    };
+    assert_eq!(binders(&env), binders(&fresh));
 
     let mut delta = Tally::default();
     let mut ex = Exporter::resume(&env, &mut delta, mark).unwrap();

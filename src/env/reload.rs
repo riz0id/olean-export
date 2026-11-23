@@ -118,7 +118,8 @@ impl Env {
     /// Decode again the modules whose oleans changed since the last load, add newly imported
     /// ones and drop those no longer imported. Every id stays valid and the tables only grow,
     /// so an [`crate::Exporter`] can resume from a [`crate::Mark`] and write just the
-    /// changes. Binder names, which no kernel reads, may differ from a fresh load.
+    /// changes. Binder names in terms, which no kernel reads, may differ from a fresh load;
+    /// [`crate::Const::binders`] does not.
     pub fn reload(&mut self) -> Result<Reload> {
         let mut live = self
             .live

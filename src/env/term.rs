@@ -82,6 +82,9 @@ pub enum Binder {
 
 /// Equality and hashing ignore binder names and annotations, matching Lean's `BEq Expr`,
 /// so terms that differ only there share one id, as they do in lean4export.
+///
+/// The binder names and annotations of a shared node are those of the earliest module in
+/// import order to have it. [`Const::binders`] has a constant's own.
 #[derive(Debug, Clone)]
 pub enum Expr {
     BVar(u64),
@@ -253,5 +256,9 @@ pub struct Const {
     pub name: NameId,
     pub level_params: Vec<NameId>,
     pub ty: ExprId,
+    /// The name and annotation of each leading `∀` of `ty`, as this constant's own olean has
+    /// them. `ty` is shared with every type that differs only there, so its own may be
+    /// another constant's.
+    pub binders: Box<[(NameId, Binder)]>,
     pub kind: Kind,
 }

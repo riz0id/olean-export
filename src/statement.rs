@@ -4,7 +4,7 @@
 //! sees them, in Lean syntax but without notation. A name Lean would not read back as itself
 //! goes in `«»`. Binder names are only labels, from one of the copies of a shared term, so
 //! they are renamed apart from each other and from the first component of every constant,
-//! and no name reads as something it is not.
+//! and no name reads as something it is not. A constant's own are in `Const::binders`.
 
 use crate::{
     env::{

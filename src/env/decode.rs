@@ -586,14 +586,7 @@ impl<'a> Decoder<'a> {
                 }
                 continue;
             }
-            let binder = || {
-                Ok::<_, Error>(match img.scalar_u8(o, 8)? {
-                    0 => Binder::Default,
-                    1 => Binder::Implicit,
-                    2 => Binder::StrictImplicit,
-                    _ => Binder::InstImplicit,
-                })
-            };
+            let binder = || binder_info(img, o);
             let e = match tag {
                 0 => Expr::BVar(small_nat(f(0)?)?),
                 3 => Expr::Sort(self.level(f(0)?)?),
@@ -664,6 +657,23 @@ impl<'a> Decoder<'a> {
             .ok_or_else(|| corrupt("subterm decoded out of order"))
     }
 
+    /// The binders of the leading `∀`s of the type at `o`, which [`Self::expr`] has decoded:
+    /// one for each leading `Pi` of the term it gave, since both read through `mdata`.
+    fn binders(&mut self, mut o: u64) -> Result<Box<[(NameId, Binder)]>> {
+        let img = self.img;
+        let mut out = Vec::new();
+        loop {
+            match img.tag(o)? {
+                7 => {
+                    out.push((self.name(img.field(o, 0)?)?, binder_info(img, o)?));
+                    o = img.field(o, 2)?;
+                }
+                10 => o = img.field(o, 1)?,
+                _ => return Ok(out.into()),
+            }
+        }
+    }
+
     fn constant(&mut self, info: u64) -> Result<()> {
         let img = self.img;
         let tag = img.tag(info)?;
@@ -680,7 +690,9 @@ impl<'a> Decoder<'a> {
         for &p in &level_params {
             self.tables.levels.intern(Level::Param(p));
         }
-        let ty = self.expr(img.field(cv, 2)?)?;
+        let ty_at = img.field(cv, 2)?;
+        let ty = self.expr(ty_at)?;
+        let binders = self.binders(ty_at)?;
         let kind = match tag {
             AXIOM => Kind::Axiom,
             DEFN => {
@@ -761,10 +773,21 @@ impl<'a> Decoder<'a> {
             name,
             level_params,
             ty,
+            binders,
             kind,
         });
         Ok(())
     }
+}
+
+/// The annotation of the binder at `o`, a `lam` or `forallE`.
+fn binder_info(img: &Image, o: u64) -> Result<Binder> {
+    Ok(match img.scalar_u8(o, 8)? {
+        0 => Binder::Default,
+        1 => Binder::Implicit,
+        2 => Binder::StrictImplicit,
+        _ => Binder::InstImplicit,
+    })
 }
 
 /// Decode the entries `want` of the module at `path`, from its public part alone when that

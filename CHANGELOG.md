@@ -9,6 +9,7 @@
 - Exporting a proof still in its olean fails with `Error::Unfetched`, naming the theorem.
 - Lazy loads (`load_statements`, `load_attrs_lazy`) and lazy theorem fetches read olean pages on demand rather than up front.
 - Add `OleanLevel`, `Env::load_attrs_at` and `Env::load_attrs_lazy_at`, to read extension entries a module in the module system keeps out of its public part, such as `Lean.declRangeExt`.
+- Add `Const::binders`, the names and info of a constant's own leading binders, which its shared `ty` may not have. A `Const` built by hand now needs it.
 
 ## 0.7.0 (2026-11-17)
 
